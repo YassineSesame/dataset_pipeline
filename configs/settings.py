@@ -25,7 +25,10 @@ class PipelineConfig:
     wiki_max_pages: int = 5
     extract_full_articles: bool = True
     min_keyword_matches: int = 1
-    min_relevance_score: float = 0.10
+    min_relevance_score: float = 0.15
+    min_relevance: float = 0.12
+    min_avg_relevance: float = 0.12
+    strict_news_relevance: bool = True
     cache_ttl_hours_web: float = 168
     cache_ttl_hours_news: float = 24
     cache_ttl_hours_rss: float = 24

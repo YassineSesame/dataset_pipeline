@@ -4,6 +4,7 @@ from typing import Dict, List
 from dataclasses import dataclass, field
 
 from utils.provenance import infer_source_type, matched_keywords
+from utils.relevance import compute_relevance_score
 
 
 @dataclass
@@ -15,6 +16,7 @@ class ProcessedDocument:
     entities: List[Dict] = field(default_factory=list)
     word_count: int = 0
     quality_score: float = 0.0
+    relevance_score: float = 0.0
     source: str = ""
     source_type: str = ""
     metadata: Dict = field(default_factory=dict)
@@ -40,7 +42,7 @@ class NLPProcessor:
 
         self.nlp = NLPProcessor._models[model_name]
 
-    def process(self, raw_doc, keywords: List[str] = None) -> ProcessedDocument:
+    def process(self, raw_doc, keywords: List[str] = None, theme: str = "") -> ProcessedDocument:
         keywords = keywords or []
         cleaned = self._clean_text(raw_doc.content)
         doc = self.nlp(cleaned)
@@ -50,6 +52,10 @@ class NLPProcessor:
         metadata = raw_doc.metadata or {}
         is_synthetic = metadata.get("is_synthetic", raw_doc.source == "mock")
 
+        title = metadata.get("title", "") or ""
+        relevance_text = f"{title}. {cleaned}" if title else cleaned
+        relevance = compute_relevance_score(relevance_text, keywords, theme)
+
         return ProcessedDocument(
             id=f"proc_{raw_doc.id}",
             original_id=raw_doc.id,
@@ -57,11 +63,12 @@ class NLPProcessor:
             entities=entities,
             word_count=len(cleaned.split()),
             quality_score=quality,
+            relevance_score=round(relevance, 4),
             source=raw_doc.source,
             source_type=infer_source_type(raw_doc.source, metadata),
             metadata=metadata,
             collected_at=raw_doc.collected_at,
-            keywords_matched=matched_keywords(cleaned, keywords),
+            keywords_matched=matched_keywords(relevance_text, keywords),
             is_synthetic=is_synthetic,
         )
 
@@ -82,4 +89,4 @@ class NLPProcessor:
             length_score = len(text.split()) / 500
 
         entity_score = min(len(entities) / 5, 1.0)
-        return length_score * 0.6 + entity_score * 0.4
+        return round(length_score * 0.6 + entity_score * 0.4, 4)

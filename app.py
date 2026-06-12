@@ -18,6 +18,7 @@ importlib.reload(enrichers.llm_enricher)
 
 from core.pipeline import DatasetPipeline
 from configs.settings import PipelineConfig
+from configs.theme_categories import GEMINI_MODELS
 from utils.dataset_loader import load_dataset_file
 from utils.file_parser import parse_uploaded_file
 
@@ -151,8 +152,9 @@ elif ai_provider == "Google Gemini (Cloud - Gratuit)":
     )
     ai_model = st.sidebar.selectbox(
         "Modèle Gemini",
-        ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-1.5-pro"],
-        index=0
+        GEMINI_MODELS,
+        index=0,
+        help="gemini-2.5-flash est recommandé (les modèles 1.5 sont obsolètes).",
     )
 
 if ai_provider != "Désactivé (Aucune IA)":
@@ -167,11 +169,26 @@ if ai_provider != "Désactivé (Aucune IA)":
 
 st.sidebar.markdown("---")
 with st.sidebar.expander("🔧 Paramètres avancés"):
-    min_quality = st.slider("Seuil qualité (par document)", 0.0, 1.0, 0.10, 0.05)
+    min_quality = st.slider("Seuil qualité (par document)", 0.0, 1.0, 0.10, 0.05,
+                            help="Longueur + entités spaCy — indépendant de la pertinence thématique.")
+    min_relevance = st.slider(
+        "Seuil pertinence (par document)",
+        0.0, 1.0, 0.12, 0.05,
+        help="Score thématique basé sur mots-clés + termes noyau du thème.",
+    )
     min_avg_quality = st.slider(
         "Qualité moyenne minimum",
         0.0, 1.0, 0.15, 0.05,
         help="Wikipedia seul : ~0.15. Avec NewsAPI : vous pouvez viser 0.20+.",
+    )
+    min_avg_relevance = st.slider(
+        "Pertinence moyenne minimum",
+        0.0, 1.0, 0.12, 0.05,
+        help="Rejette les datasets trop hors-sujet globalement.",
+    )
+    strict_news = st.checkbox(
+        "Filtrage strict NewsAPI (2+ mots-clés ou terme noyau)",
+        value=True,
     )
     min_documents = st.slider("Documents minimum", 1, 20, 5)
     max_docs = st.slider("Max documents par source", 5, 100, 50)
@@ -246,7 +263,10 @@ if run_button:
         sources=sources,
         language=language,
         min_quality=min_quality,
+        min_relevance=min_relevance,
         min_avg_quality=min_avg_quality,
+        min_avg_relevance=min_avg_relevance,
+        strict_news_relevance=strict_news,
         min_documents=min_documents,
         allow_mock_fallback=use_mock,
         force_refresh=force_refresh,
@@ -328,7 +348,27 @@ if run_button:
                         f"mais la validation globale a échoué."
                     )
 
-                if any("Qualite moyenne" in e or "Qualité moyenne" in e for e in errors):
+                flow = manifest.get("pipeline_flow") or stats.get("pipeline_flow", {})
+                if flow:
+                    st.write("**Entonnoir du pipeline :**")
+                    funnel_cols = st.columns(4)
+                    labels = [
+                        ("Collectés", flow.get("raw_collected")),
+                        ("Après dédup", flow.get("after_dedup")),
+                        ("Après pertinence", flow.get("after_relevance")),
+                        ("Exportés", stats.get("documents_exported", flow.get("after_nlp"))),
+                    ]
+                    for col, (label, val) in zip(funnel_cols, labels):
+                        col.metric(label, val if val is not None else "—")
+
+                if any("Pertinence moyenne" in e for e in errors):
+                    st.info(
+                        "**Comment corriger :**\n"
+                        "- Baissez **Pertinence moyenne minimum** à **0.10**\n"
+                        "- Vérifiez vos **mots-clés** (covid, vaccin, virus…)\n"
+                        "- Désactivez le filtrage strict NewsAPI si vous manquez de documents"
+                    )
+                elif any("Qualite moyenne" in e or "Qualité moyenne" in e for e in errors):
                     st.info(
                         "**Comment corriger :**\n"
                         "- Baissez **Qualité moyenne minimum** à **0.15** (Paramètres avancés)\n"
@@ -404,24 +444,63 @@ if st.session_state.dataset_result:
 
         run_id = envelope_meta.get("run_id", st.session_state.dataset_meta.get("run_id", "N/A"))
         st.caption(f"Run ID : `{run_id}` | Schéma : `{envelope_meta.get('schema_version', 'legacy')}`")
+
+        manifest = st.session_state.dataset_meta or {}
+        stats = manifest.get("stats", {})
+        flow = manifest.get("pipeline_flow") or stats.get("pipeline_flow", {})
+        if flow:
+            st.subheader("📊 Entonnoir du pipeline")
+            f1, f2, f3, f4, f5 = st.columns(5)
+            f1.metric("Collectés", flow.get("raw_collected", "—"))
+            f2.metric("Dédup", flow.get("after_dedup", "—"))
+            f3.metric("Pertinence", flow.get("after_relevance", "—"))
+            f4.metric("NLP", flow.get("after_nlp", "—"))
+            f5.metric("Exportés", stats.get("documents_exported", len(data)))
+
+            if flow.get("relevance_rejected"):
+                st.caption(f"↳ {flow['relevance_rejected']} document(s) rejetés pour hors-sujet / langue")
         
         # Métriques principales
-        col1, col2, col3, col4 = st.columns(4)
+        col1, col2, col3, col4, col5 = st.columns(5)
         with col1:
             st.metric("📄 Documents", len(data))
         with col2:
             avg_quality = envelope_meta.get("avg_quality") or (
                 sum(d.get('quality_score', 0) for d in data) / len(data) if data else 0
             )
-            st.metric("⭐ Qualité moyenne", f"{avg_quality:.2f}")
+            st.metric("⭐ Qualité moy.", f"{avg_quality:.2f}")
         with col3:
+            avg_relevance = envelope_meta.get("avg_relevance") or (
+                sum(d.get('relevance_score', 0) for d in data) / len(data) if data else 0
+            )
+            st.metric("🎯 Pertinence moy.", f"{avg_relevance:.2f}")
+        with col4:
             avg_words = sum(d.get('word_count', 0) for d in data) / len(data) if data else 0
             st.metric("📝 Mots/doc", f"{avg_words:.0f}")
-        with col4:
-            st.metric("🎯 Thème", theme.upper())
+        with col5:
+            st.metric("🏷️ Thème", theme.upper())
         
-        # NOUVEAU : Métriques d'enrichissement
-        if data and any('category' in d for d in data):
+        # Enrichissement IA
+        enrichment_stats = stats.get("enrichment", {})
+        if enrichment_stats:
+            st.markdown("---")
+            st.subheader("🧠 Enrichissements IA")
+            e1, e2, e3, e4 = st.columns(4)
+            e1.metric("Demandés", enrichment_stats.get("requested", 0))
+            e2.metric("Succès", enrichment_stats.get("success", 0))
+            e3.metric("Échecs", enrichment_stats.get("failed", 0))
+            e4.metric("Modèle", enrichment_stats.get("model", "N/A"))
+
+            if enrichment_stats.get("failed", 0) > 0:
+                st.warning(
+                    f"{enrichment_stats['failed']} enrichissement(s) ont échoué. "
+                    "Consultez l'onglet Traçabilité ou les champs enrichment_error."
+                )
+                errors = enrichment_stats.get("errors", [])
+                if errors:
+                    with st.expander("Détail des erreurs d'enrichissement"):
+                        st.json(errors)
+        elif data and any('category' in d for d in data):
             st.markdown("---")
             st.subheader("🧠 Enrichissements IA")
             
@@ -452,21 +531,32 @@ if st.session_state.dataset_result:
         tab1, tab2, tab3, tab4 = st.tabs(["📊 Tableau", "🔍 Aperçu", "📥 Téléchargement", "📋 Traçabilité"])
         
         with tab1:
-            display_cols = ['id', 'word_count', 'quality_score', 'theme']
-            if data and 'provenance' in data[0]:
-                display_cols = ['id', 'word_count', 'quality_score', 'theme']
-            if data and 'category' in data[0]:
-                display_cols = ['id', 'word_count', 'quality_score', 'category', 'sentiment', 'theme']
-            
-            available_cols = [c for c in display_cols if c in df.columns]
-            st.dataframe(df[available_cols].head(20), use_container_width=True, hide_index=True)
+            flat_data = []
+            for d in data:
+                row = {
+                    "id": d.get("id"),
+                    "word_count": d.get("word_count"),
+                    "quality_score": d.get("quality_score"),
+                    "relevance_score": d.get("relevance_score"),
+                    "theme": d.get("theme"),
+                    "category": d.get("category"),
+                    "sentiment": d.get("sentiment"),
+                    "enrichment_status": d.get("enrichment_status"),
+                }
+                flat_data.append(row)
+            display_df = pd.DataFrame(flat_data)
+            st.dataframe(display_df.head(20), use_container_width=True, hide_index=True)
         
         with tab2:
             if len(data) > 0:
                 doc_index = st.selectbox(
                     "Choisir un document",
                     range(len(data)),
-                    format_func=lambda i: f"Doc {i+1} - {data[i].get('category', 'Sans catégorie')} (score: {data[i].get('quality_score', 0):.2f})"
+                    format_func=lambda i: (
+                        f"Doc {i+1} - {data[i].get('category', 'Sans catégorie')} "
+                        f"(Q:{data[i].get('quality_score', 0):.2f} / "
+                        f"R:{data[i].get('relevance_score', 0):.2f})"
+                    )
                 )
                 
                 doc = data[doc_index]
@@ -502,10 +592,14 @@ if st.session_state.dataset_result:
                     "id": doc.get('id'),
                     "word_count": doc.get('word_count'),
                     "quality_score": doc.get('quality_score'),
+                    "relevance_score": doc.get('relevance_score'),
+                    "keywords_matched": doc.get('keywords_matched', []),
                     "theme": doc.get('theme'),
                     "category": doc.get('category', 'N/A'),
                     "sentiment": doc.get('sentiment', 'N/A'),
                     "keywords": doc.get('keywords', []),
+                    "enrichment_status": doc.get('enrichment_status'),
+                    "enrichment_error": doc.get('enrichment_error'),
                 }
                 st.json(meta)
 
@@ -563,7 +657,8 @@ if st.session_state.dataset_result:
         
         with col_chart1:
             quality_scores = [d.get('quality_score', 0) for d in data]
-            chart_df = pd.DataFrame({'Qualité': quality_scores})
+            relevance_scores = [d.get('relevance_score', 0) for d in data]
+            chart_df = pd.DataFrame({'Qualité': quality_scores, 'Pertinence': relevance_scores})
             st.bar_chart(chart_df)
         
         with col_chart2:
@@ -579,4 +674,4 @@ else:
     st.info("👈 Configurez les paramètres et cliquez sur **Lancer le Pipeline**")
 
 st.markdown("---")
-st.caption("🧠 Pipeline Dataset Intelligence v3.0 | Tier 2 | Traçabilité & sources enrichies")
+st.caption("🧠 Pipeline Dataset Intelligence v3.1 | Schéma 1.2 | Pertinence & enrichissement durcis")

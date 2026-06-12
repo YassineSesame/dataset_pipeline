@@ -18,7 +18,7 @@ from utils.deduplication import deduplicate_documents
 from utils.provenance import build_provenance
 from utils.relevance import filter_raw_documents
 
-SCHEMA_VERSION = "1.1"
+SCHEMA_VERSION = "1.2"
 
 
 class DatasetPipeline:
@@ -36,6 +36,7 @@ class DatasetPipeline:
             min_documents=config.min_documents,
             min_avg_quality=config.min_avg_quality,
             min_avg_length=config.min_avg_length,
+            min_avg_relevance=getattr(config, "min_avg_relevance", 0.12),
         )
         self.ai_provider = ai_provider or "none"
         self.ai_key = ai_key
@@ -48,6 +49,7 @@ class DatasetPipeline:
         self.rejected_records: List[dict] = []
         self.run_stats = {}
         self.source_counts: dict = {}
+        self.pipeline_flow: dict = {}
 
         if self.ai_provider.lower() != "none":
             try:
@@ -76,6 +78,7 @@ class DatasetPipeline:
             raw_docs.extend(self.config.uploaded_documents)
             print(f"   -> +{len(self.config.uploaded_documents)} document(s) importe(s)")
         raw_count = len(raw_docs)
+        self.pipeline_flow["raw_collected"] = raw_count
         print(f"   -> {raw_count} documents bruts trouves")
 
         if raw_count < self.config.min_documents:
@@ -114,6 +117,7 @@ class DatasetPipeline:
 
         raw_docs, duplicate_rejects = deduplicate_documents(raw_docs, content_attr="content")
         self.rejected_records.extend(duplicate_rejects)
+        self.pipeline_flow["after_dedup"] = len(raw_docs)
         print(f"   -> {len(raw_docs)} documents uniques ({len(duplicate_rejects)} doublons supprimes)")
 
         msg_rel = "\n[1c/5] Filtrage pertinence et langue..."
@@ -128,8 +132,11 @@ class DatasetPipeline:
             expected_language=self.config.language,
             min_keyword_matches=self.config.min_keyword_matches,
             min_relevance_score=self.config.min_relevance_score,
+            strict_news=getattr(self.config, "strict_news_relevance", True),
         )
         self.rejected_records.extend(relevance_rejects)
+        self.pipeline_flow["after_relevance"] = len(raw_docs)
+        self.pipeline_flow["relevance_rejected"] = len(relevance_rejects)
         print(
             f"   -> {len(raw_docs)} documents pertinents "
             f"({len(relevance_rejects)} rejetes par pertinence/langue)"
@@ -154,6 +161,8 @@ class DatasetPipeline:
 
         processed_docs, processing_rejects = self._process_documents(raw_docs)
         self.rejected_records.extend(processing_rejects)
+        self.pipeline_flow["after_nlp"] = len(processed_docs)
+        self.pipeline_flow["nlp_rejected"] = len(processing_rejects)
         print(f"   -> {len(processed_docs)} documents retenus ({len(processing_rejects)} rejetes au filtre)")
 
         msg_val = "\n[3/5] Validation qualite..."
@@ -265,8 +274,23 @@ class DatasetPipeline:
 
         for doc in raw_docs:
             try:
-                proc = self.processor.process(doc, self.config.keywords)
-                if proc.quality_score >= self.config.min_quality:
+                proc = self.processor.process(doc, self.config.keywords, self.config.theme)
+                min_rel = getattr(self.config, "min_relevance", 0.12)
+
+                if proc.relevance_score < min_rel:
+                    rejected.append(
+                        {
+                            "id": doc.id,
+                            "stage": "nlp_filter",
+                            "reason": "relevance_below_threshold",
+                            "relevance_score": proc.relevance_score,
+                            "threshold": min_rel,
+                            "quality_score": round(proc.quality_score, 4),
+                            "source": doc.source,
+                            "is_synthetic": proc.is_synthetic,
+                        }
+                    )
+                elif proc.quality_score >= self.config.min_quality:
                     processed.append(proc)
                 else:
                     rejected.append(
@@ -275,6 +299,7 @@ class DatasetPipeline:
                             "stage": "nlp_filter",
                             "reason": "quality_below_threshold",
                             "quality_score": round(proc.quality_score, 4),
+                            "relevance_score": proc.relevance_score,
                             "threshold": self.config.min_quality,
                             "source": doc.source,
                             "is_synthetic": proc.is_synthetic,
@@ -310,6 +335,8 @@ class DatasetPipeline:
             "word_count": doc.word_count,
             "entities": doc.entities,
             "quality_score": doc.quality_score,
+            "relevance_score": doc.relevance_score,
+            "keywords_matched": doc.keywords_matched,
             "theme": self.config.theme,
             "provenance": provenance,
             "summary": "",
@@ -321,7 +348,11 @@ class DatasetPipeline:
 
     def _enrich_documents(self, processed_docs: List[ProcessedDocument], status_callback=None) -> List[dict]:
         if self.enricher and len(processed_docs) > 0:
-            sorted_docs = sorted(processed_docs, key=lambda d: d.quality_score, reverse=True)
+            sorted_docs = sorted(
+                processed_docs,
+                key=lambda d: (d.relevance_score, d.quality_score),
+                reverse=True,
+            )
             to_enrich = sorted_docs[: self.max_enrich_docs]
             skipped = sorted_docs[self.max_enrich_docs :]
 
@@ -337,7 +368,13 @@ class DatasetPipeline:
             enriched_records = self.enricher.enrich_batch(
                 records, self.config.theme, status_callback=status_callback
             )
-            print(f"   -> {len(enriched_records)} documents enrichis par l'IA")
+            enrichment_stats = getattr(self.enricher, "last_batch_stats", {})
+            self.run_stats["enrichment"] = enrichment_stats
+            print(
+                f"   -> Enrichissement : {enrichment_stats.get('success', 0)} succes, "
+                f"{enrichment_stats.get('failed', 0)} echecs "
+                f"(modele: {enrichment_stats.get('model', 'N/A')})"
+            )
 
             for doc in skipped:
                 record = self._build_base_record(doc)
@@ -348,6 +385,8 @@ class DatasetPipeline:
                         "sentiment": "Neutre",
                         "keywords": [],
                         "qa_pairs": [],
+                        "enrichment_status": "skipped",
+                        "enrichment_error": None,
                     }
                 )
                 enriched_records.append(record)
@@ -359,7 +398,10 @@ class DatasetPipeline:
         if status_callback:
             status_callback(msg)
 
-        return [self._build_base_record(doc) for doc in processed_docs]
+        return [
+            {**self._build_base_record(doc), "enrichment_status": "disabled", "enrichment_error": None}
+            for doc in processed_docs
+        ]
 
     def _export(self, documents: List[dict], validation_errors: List[str]) -> str:
         print("\n[5/5] Export...")
@@ -367,6 +409,9 @@ class DatasetPipeline:
         synthetic_count = sum(1 for d in documents if d.get("provenance", {}).get("is_synthetic"))
         avg_quality = (
             sum(d.get("quality_score", 0) for d in documents) / len(documents) if documents else 0
+        )
+        avg_relevance = (
+            sum(d.get("relevance_score", 0) for d in documents) / len(documents) if documents else 0
         )
 
         envelope = {
@@ -377,6 +422,7 @@ class DatasetPipeline:
             "document_count": len(documents),
             "synthetic_count": synthetic_count,
             "avg_quality": round(avg_quality, 4),
+            "avg_relevance": round(avg_relevance, 4),
             "documents": documents,
         }
 
@@ -393,6 +439,7 @@ class DatasetPipeline:
                     "text": doc.get("text", "")[:500] + "...",
                     "word_count": doc.get("word_count"),
                     "quality_score": doc.get("quality_score"),
+                    "relevance_score": doc.get("relevance_score"),
                     "theme": doc.get("theme"),
                     "source_type": prov.get("source_type"),
                     "source_url": prov.get("source_url"),
@@ -413,6 +460,9 @@ class DatasetPipeline:
             "synthetic_documents": synthetic_count,
             "rejected_total": len(self.rejected_records),
             "avg_quality": round(avg_quality, 4),
+            "avg_relevance": round(avg_relevance, 4),
+            "pipeline_flow": self.pipeline_flow,
+            "source_counts": self.source_counts,
         }
 
         self._write_rejected_report()
@@ -433,6 +483,7 @@ class DatasetPipeline:
         print(f"\n   📊 APERCU DU DATASET :")
         print(f"      - {len(documents)} documents ({synthetic_count} synthetiques)")
         print(f"      - Qualite moyenne: {avg_quality:.2f}")
+        print(f"      - Pertinence moyenne: {avg_relevance:.2f}")
         print(f"      - Categories: {categories}")
         print(f"      - Sentiments: {sentiments}")
         print(f"      - Manifest : {os.path.join(self.run_dir, 'manifest.json')}")
@@ -464,6 +515,15 @@ class DatasetPipeline:
                 indent=2,
             )
 
+    def _sanitize_sources(self, sources: List[dict]) -> List[dict]:
+        sanitized = []
+        for source in sources:
+            copy = dict(source)
+            if copy.get("api_key"):
+                copy["api_key"] = "***"
+            sanitized.append(copy)
+        return sanitized
+
     def _write_manifest(
         self,
         status: str,
@@ -479,11 +539,13 @@ class DatasetPipeline:
             "completed_at": datetime.now().isoformat(),
             "theme": self.config.theme,
             "keywords": self.config.keywords,
-            "sources": self.config.sources,
+            "sources": self._sanitize_sources(self.config.sources),
             "config": {
                 "language": self.config.language,
                 "min_quality": self.config.min_quality,
+                "min_relevance": getattr(self.config, "min_relevance", 0.12),
                 "min_avg_quality": self.config.min_avg_quality,
+                "min_avg_relevance": getattr(self.config, "min_avg_relevance", 0.12),
                 "min_documents": self.config.min_documents,
                 "min_avg_length": self.config.min_avg_length,
                 "allow_mock_fallback": self.config.allow_mock_fallback,
@@ -493,8 +555,10 @@ class DatasetPipeline:
                 "extract_full_articles": self.config.extract_full_articles,
                 "min_keyword_matches": self.config.min_keyword_matches,
                 "min_relevance_score": self.config.min_relevance_score,
+                "strict_news_relevance": getattr(self.config, "strict_news_relevance", True),
             },
             "stats": self.run_stats,
+            "pipeline_flow": self.pipeline_flow,
             "validation": {"passed": status == "success", "errors": validation_errors},
             "output_files": output_files or {},
             "rejected_report": os.path.join(self.run_dir, "rejected.json"),
@@ -514,6 +578,8 @@ class DatasetPipeline:
             "documents_exported": 0,
             "rejected_total": len(self.rejected_records),
             "processed_before_failure": len(processed_docs or []),
+            "pipeline_flow": self.pipeline_flow,
+            "source_counts": self.source_counts,
         }
         self._write_rejected_report()
         self._write_manifest(
